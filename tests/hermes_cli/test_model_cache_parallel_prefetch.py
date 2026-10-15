@@ -12,6 +12,8 @@ from __future__ import annotations
 import time
 from unittest.mock import patch
 
+import pytest
+
 # ---------------------------------------------------------------------------
 # Thread-safe cache entry update (hermes_cli/models.py)
 # ---------------------------------------------------------------------------
@@ -72,6 +74,52 @@ class TestStoreCacheEntry:
         for p in providers:
             assert p in cache, f"{p} was lost in concurrent write"
             assert cache[p]["models"] == [f"model_{p}"]
+
+    @pytest.mark.parametrize("cleared", ["openrouter", None])
+    def test_clear_is_not_undone_by_a_concurrent_locked_write(self, tmp_path, monkeypatch, cleared):
+        """``--refresh`` clears under the same lock: a writer that loaded the cache before the clear
+        must not save its snapshot afterwards and bring the cleared row back."""
+        import threading
+
+        import hermes_cli.models as mod
+        from hermes_cli.models_cache_lock import write_under_cache_lock
+
+        import hermes_cli.models_cache_lock as cache_lock_module
+        from tests.lock_contention import ContentionObservedLock, watch_file_lock_contention
+        from tests.waiting import wait_until
+
+        cache_path = tmp_path / "provider_models_cache.json"
+        monkeypatch.setattr(mod, "_provider_models_cache_path", lambda: cache_path)
+        contended = watch_file_lock_contention(monkeypatch)
+        # In-process writers meet the thread lock first, other processes the file lock.
+        thread_lock = ContentionObservedLock()
+        monkeypatch.setattr(cache_lock_module, "_thread_lock", thread_lock)
+        mod._save_provider_models_cache({
+            "openrouter": mod._cache_entry("fp", ["or/model"]),
+            "anthropic": mod._cache_entry("fp", ["claude"]),
+        })
+        loaded = threading.Event()
+        release = threading.Event()
+
+        def slow_write():  # _store_cache_entry's write, paused between its read and its save
+            cache = mod._load_provider_models_cache()
+            loaded.set()
+            release.wait(5)
+            cache["anthropic"] = mod._cache_entry("fp", ["claude-new"])
+            mod._save_provider_models_cache(cache)
+
+        writer = threading.Thread(target=write_under_cache_lock, args=(cache_path, slow_write))
+        writer.start()
+        assert loaded.wait(5)
+        clearer = threading.Thread(target=mod.clear_provider_models_cache, args=(cleared,))
+        clearer.start()
+        wait_until(lambda: not clearer.is_alive() or contended.is_set() or thread_lock.contended.is_set(),
+                   what="the clear finished or blocked on the cache lock")
+        release.set()
+        writer.join(5)
+        clearer.join(5)
+
+        assert "openrouter" not in mod._load_provider_models_cache()
 
 # ---------------------------------------------------------------------------
 # Parallel prefetch (hermes_cli/model_switch.py)

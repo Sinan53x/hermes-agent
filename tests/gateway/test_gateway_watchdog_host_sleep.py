@@ -138,3 +138,28 @@ def test_stale_agent_eviction_ignores_host_sleep(clock, monkeypatch):
 
     runner._hm_evict_idle_stale_agent("k")
     assert evicted_at_read == [2]
+
+
+def test_stale_agent_eviction_drops_sleep_credit_once_the_agent_was_active_again(clock, monkeypatch):
+    """Eviction samples the meter only when a message arrives. Sleep before the agent's
+    post-resume activity must not keep discounting the idle time that followed that activity."""
+    monkeypatch.setenv("HERMES_AGENT_TIMEOUT", str(TIMEOUT_S))
+    turn = TurnState(ctx=TurnContext(), started_ts=clock.wall)
+
+    def work_after_resume_then_idle(c):
+        c.awake(10.0)
+        agent._origin = c.wall  # the agent's last activity
+        c.awake(TIMEOUT_S)
+
+    agent = _ScriptedAgent(clock, [lambda c: c.sleep(SLEEP_S), work_after_resume_then_idle])
+    turn.agent = agent
+    runner = object.__new__(GatewayRunner)
+    runner._peek_session_state = lambda _key: SimpleNamespace(turn=turn)
+    evicted_at_read = []
+    runner._hm_evict_running_agent = lambda _key, _reason: evicted_at_read.append(agent.reads)
+
+    runner._hm_evict_idle_stale_agent("k")
+    assert evicted_at_read == []
+
+    runner._hm_evict_idle_stale_agent("k")
+    assert evicted_at_read == [2]

@@ -290,7 +290,7 @@ async def test_voice_note_merged_during_pending_stt_is_transcribed():
     stt_started = asyncio.Event()
     release = asyncio.Event()
 
-    async def fake_enrich(text, paths):
+    async def fake_enrich(text, paths, _clip_memo=None):
         stt_started.set()
         await release.wait()
         transcripts = [f"<{Path(p).name}>" for p in paths]
@@ -324,7 +324,7 @@ async def test_caption_of_voice_note_merged_during_pending_stt_is_kept():
     stt_started = asyncio.Event()
     release = asyncio.Event()
 
-    async def fake_enrich(text, paths):
+    async def fake_enrich(text, paths, _clip_memo=None):
         stt_started.set()
         await release.wait()
         transcripts = [f"<{Path(p).name}>" for p in paths]
@@ -351,3 +351,35 @@ async def test_caption_of_voice_note_merged_during_pending_stt_is_kept():
         assert "<B.ogg>" in text
         assert "first caption" in text
         assert "second caption" in text
+
+
+@pytest.mark.asyncio
+async def test_burst_of_merged_voice_notes_transcribes_each_clip_once():
+    """STT is paid and delays the interrupt: a re-run after a merge must transcribe only the new
+    clips, and so must the drain path's re-run after a later merge drops the cached result."""
+    from gateway.platforms.base import merge_pending_message_event
+
+    runner = _runner()
+    source = _source()
+    pending = {}
+    merge_pending_message_event(pending, "k", _voice_event(source, ["/tmp/A.ogg"]))
+    event = pending["k"]
+    burst = ["/tmp/B.ogg", "/tmp/C.ogg", "/tmp/D.ogg"]
+    calls = []
+
+    async def fake_clip(path, *_stt):
+        calls.append(Path(path).name)
+        if burst:  # the next note of the burst arrives while this clip is being transcribed
+            merge_pending_message_event(pending, "k", _voice_event(source, [burst.pop(0)]))
+        await asyncio.sleep(0)
+        return f"<{Path(path).name}>", f"<{Path(path).name}>"
+
+    runner._transcribe_one_clip = fake_clip
+    _, transcripts = await runner._transcribe_pending_audio_event_once(event)
+    assert transcripts == ["<A.ogg>", "<B.ogg>", "<C.ogg>", "<D.ogg>"]
+
+    merge_pending_message_event(pending, "k", _voice_event(source, ["/tmp/E.ogg"]))
+    _, drain_transcripts = await runner._transcribe_pending_audio_event_once(event)
+
+    assert drain_transcripts == ["<A.ogg>", "<B.ogg>", "<C.ogg>", "<D.ogg>", "<E.ogg>"]
+    assert calls == ["A.ogg", "B.ogg", "C.ogg", "D.ogg", "E.ogg"]

@@ -294,3 +294,26 @@ def test_concurrent_snapshot_stores_keep_both_tasks(tmp_path, monkeypatch):
         "direct:task-A": "im-AAAA",
         "direct:task-B": "im-BBBB",
     }
+
+
+def test_snapshot_store_update_proceeds_when_the_lock_is_unavailable(tmp_path, monkeypatch):
+    """A wedged or unsupported lock must not abort a sandbox lifecycle step: modal's restore
+    fallback deletes the failed snapshot id and then retries with the base image."""
+    import contextlib
+
+    import hermes_cli.auth as auth_module
+    import tools.environments.modal as modal_module
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+
+    @contextlib.contextmanager
+    def wedged_lock(*_args, **_kwargs):
+        raise TimeoutError("Timed out waiting for the snapshot store lock")
+        yield
+
+    modal_module._store_direct_snapshot("task-A", "im-AAAA")
+    monkeypatch.setattr(auth_module, "_file_lock", wedged_lock)
+
+    modal_module._delete_direct_snapshot("task-A", "im-AAAA")
+
+    assert json.loads(modal_module._snapshot_store().read_text(encoding="utf-8")) == {}

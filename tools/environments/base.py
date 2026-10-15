@@ -215,11 +215,21 @@ def _update_json_store(path: Path, update: Callable[[dict], None]) -> None:
     """Read-modify-write the JSON store at *path* under a cross-process lock.
 
     Concurrent sandbox cleanups (delegate children, gateway sessions, the idle reaper) each
-    record a snapshot id; an unlocked load/mutate/save lets one cleanup drop the other's entry."""
+    record a snapshot id; an unlocked load/mutate/save lets one cleanup drop the other's entry.
+    An unusable lock (no flock on the filesystem, a wedged holder) degrades to an unlocked
+    update: a sandbox lifecycle step (modal's restore fallback included) must not abort on it."""
+    from contextlib import ExitStack
+
     from hermes_cli.auth import _file_lock
 
     lock_path = path.with_name(f"{path.name}.lock")
-    with _file_lock(lock_path, _JSON_STORE_LOCK_HOLDER, 10.0, f"Timed out waiting for the snapshot store lock ({path})"):
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(_file_lock(
+                lock_path, _JSON_STORE_LOCK_HOLDER, 10.0, f"Timed out waiting for the snapshot store lock ({path})",
+            ))
+        except (OSError, TimeoutError):
+            logger.warning("Updating %s without its lock", path, exc_info=True)
         data = _load_json_store(path)
         before = dict(data)
         update(data)

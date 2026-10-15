@@ -84,3 +84,23 @@ def test_takeover_owed_finish_never_exposes_an_empty_exit_code(home, tmp_path, q
         _record_owed_finish({"gateway_mode": True}, tmp_path / "result.json", "child missing")
     assert "" not in seen
     assert marker.read_text(encoding="utf-8").strip() == "0"
+
+
+@pytest.mark.parametrize("recorder", ["failure", "owed_finish"])
+def test_takeover_records_without_runtime_state_or_pm(home, tmp_path, quiet_receipt, monkeypatch, recorder):
+    """The takeover bootstraps before the app is importable; its recorders must still write
+    result.json and the gateway exit code when hermes_cli.runtime_state (→ pm) cannot be imported."""
+    import sys
+
+    from hermes_cli import _update_takeover
+
+    for module in ("hermes_cli.runtime_state", "pm", "pm.filesystem"):
+        monkeypatch.setitem(sys.modules, module, None)
+    result = tmp_path / "result.json"
+    if recorder == "failure":
+        _update_takeover._record_failure({"gateway_mode": True}, result, 3, "boom")
+    else:
+        _update_takeover._record_owed_finish({"gateway_mode": True}, result, "child missing")
+
+    assert result.exists()
+    assert (home / ".update_exit_code").read_text(encoding="utf-8").strip() == ("3" if recorder == "failure" else "0")

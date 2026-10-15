@@ -81,7 +81,14 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin)
         # Rate-limit ALL pairing responses (code or rejection) so a burst of DMs doesn't spam.
         if pairing_store._is_rate_limited(platform_name, source.user_id):
             return
-        code = pairing_store.generate_code(platform_name, source.user_id, source.user_name or "")
+        # Off the event loop: the store edit waits on a cross-process lock (dashboard, CLI).
+        try:
+            code = await asyncio.to_thread(
+                pairing_store.generate_code, platform_name, source.user_id, source.user_name or "",
+            )
+        except (OSError, TimeoutError):
+            logger.warning("Could not record a pairing code on %s", platform_name, exc_info=True)
+            return
         adapter = self._delivery_adapter_for(source)
         if code:
             reply = pairing_code_reply(platform_name, code, pairing_profile_arg(pairing_store))
@@ -102,7 +109,12 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin)
         pairing_store = self._pairing_store_for(source)
         if pairing_store is None or pairing_store.has_recent_decline(platform_name, source.user_id):
             return
-        pairing_store.record_decline(platform_name, source.user_id)
+        # Off the event loop (the stamp waits on a cross-process lock); no stamp → no dedupe → silent.
+        try:
+            await asyncio.to_thread(pairing_store.record_decline, platform_name, source.user_id)
+        except (OSError, TimeoutError):
+            logger.warning("Could not record an unauthorized-DM decline on %s", platform_name, exc_info=True)
+            return
         adapter = self._delivery_adapter_for(source)
         if not adapter:
             return
@@ -1843,11 +1855,12 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin)
         return transcript, f'"{transcript}"'
 
     async def _enrich_message_with_transcription(
-        self, user_text: str, audio_paths: list[str]
+        self, user_text: str, audio_paths: list[str], clip_memo: Optional[dict] = None
     ) -> tuple[str, list[str]]:
         """Transcribe voice clips with the configured STT provider and prepend the transcripts →
         ``(enriched_text, successful_transcripts)``; the transcripts (input order; empty if every clip
-        failed or STT is disabled) let callers echo them back before the agent loop."""
+        failed or STT is disabled) let callers echo them back before the agent loop. ``clip_memo``
+        (path → ``_transcribe_one_clip`` result) skips clips an earlier pass already transcribed."""
         from gateway.run import _probe_audio_duration
         audio_paths = list(dict.fromkeys(audio_paths))
         if not getattr(self.config, "stt_enabled", True):
@@ -1871,10 +1884,15 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin)
         successful_transcripts: list[str] = []
         for path in audio_paths:
             try:
-                logger.debug("Transcribing user voice: %s", path)
-                transcript, note = await self._transcribe_one_clip(
-                    path, transcribe_audio, transcribe_audio_local_fallback,
-                )
+                if clip_memo is not None and path in clip_memo:
+                    transcript, note = clip_memo[path]
+                else:
+                    logger.debug("Transcribing user voice: %s", path)
+                    transcript, note = await self._transcribe_one_clip(
+                        path, transcribe_audio, transcribe_audio_local_fallback,
+                    )
+                    if clip_memo is not None:
+                        clip_memo[path] = (transcript, note)
                 if transcript is not None:
                     successful_transcripts.append(transcript)
                 enriched_parts.append(note)
@@ -1906,13 +1924,21 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin)
         if not audio_paths:
             return user_text if user_text is not None else (getattr(event, "text", None) or None), []
         text = user_text if user_text is not None else (getattr(event, "text", "") or "")
-        enriched_text, successful_transcripts = await self._enrich_message_with_transcription(text, audio_paths)
+        # Per-clip results outlive the merged-event cache below (a merge drops only that), so every
+        # re-run — this loop's or the drain path's — transcribes just the newly merged clips.
+        clip_memo = getattr(event, "_gateway_pending_stt_clips", None)
+        if clip_memo is None:
+            clip_memo = {}
+            event._gateway_pending_stt_clips = clip_memo
+        enriched_text, successful_transcripts = await self._enrich_message_with_transcription(text, audio_paths, clip_memo)
         # A voice note merged in during the await dropped a cache that did not exist yet; re-run on
         # the merged media rather than publish a transcript that silently omits the new note.
         while self._pending_event_audio_paths(event) != audio_paths:
             audio_paths = self._pending_event_audio_paths(event)
             text = user_text if user_text is not None else (getattr(event, "text", "") or "")
-            enriched_text, successful_transcripts = await self._enrich_message_with_transcription(text, audio_paths)
+            enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
+                text, audio_paths, clip_memo,
+            )
         event._gateway_pending_stt_text = enriched_text
         event._gateway_pending_stt_transcripts = list(successful_transcripts)
         return enriched_text, successful_transcripts

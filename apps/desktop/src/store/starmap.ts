@@ -73,7 +73,9 @@ export function evictStarmapNode(id: string): () => void {
   return () => $starmapGraph.set(prev)
 }
 
-/** Drop the cache so the next open refetches against the now-active profile. */
+/** Drop the cache (and strand any in-flight load) so the next load scans the new scope. Does not
+ *  reload: a gateway switch resets before the new connection is active; callers reload an open
+ *  view once the new request scope is published (reloadOpenStarmapGraph). */
 export function resetStarmapGraph(): void {
   starmapEpoch += 1
   inflight = null
@@ -81,4 +83,25 @@ export function resetStarmapGraph(): void {
   $starmapError.set(null)
   // The stranded load no longer owns the spinner; a fresh load re-raises it.
   $starmapLoading.set(false)
+}
+
+let openStarmapViews = 0
+
+/** Reload a mounted Star Map view after a reset, once requests route to the new scope. A view
+ *  loads on mount only, so nothing else would refetch it. */
+export function reloadOpenStarmapGraph(): void {
+  if (openStarmapViews > 0) {
+    void loadStarmapGraph()
+  }
+}
+
+/** Load the graph for a mounted Star Map view and keep it loaded across profile/gateway resets
+ *  while the view stays open. Returns the unmount cleanup. */
+export function watchStarmapGraph(): () => void {
+  openStarmapViews += 1
+  void loadStarmapGraph()
+
+  return () => {
+    openStarmapViews -= 1
+  }
 }

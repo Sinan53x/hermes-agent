@@ -49,3 +49,24 @@ def locked_context_cache(fn):
                 return None
             return fn(*args, **kwargs)
     return wrapper
+
+
+@locked_context_cache
+def drop_context_cache_rows(stale_keys: set[str], label: str) -> None:
+    """Remove every key shape of one cached entry (and its Bedrock provenance) under the cache lock.
+
+    Only the file update is locked: callers evict their in-process probe caches unconditionally."""
+    from agent.model_metadata import _load_context_cache_document  # facade seam: tests patch it there
+    document = _load_context_cache_document()
+    cache = document.get("context_lengths") or {}
+    confirmed = document.get("bedrock_confirmed_v1") or {}
+    confirmed = confirmed if isinstance(confirmed, dict) else {}
+    if not any(k in cache or k in confirmed for k in stale_keys):
+        return
+    for k in stale_keys:
+        cache.pop(k, None)
+        confirmed.pop(k, None)
+    try:
+        _write_context_cache(cache, confirmed)
+    except Exception:
+        logger.debug("Failed to invalidate context length cache entry %s", label, exc_info=True)

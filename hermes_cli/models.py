@@ -2169,16 +2169,23 @@ def clear_provider_models_cache(provider: Optional[str] = None) -> None:
         # a stale signed-out probe past an explicit refresh.
         global _copilot_acp_session_memo
         _copilot_acp_session_memo = None
-        if provider is None:
-            path = _provider_models_cache_path()
-            if path.exists():
-                path.unlink()
-            return
-        cache = _load_provider_models_cache()
-        normalized = _normalized_cache_slug(provider)
-        if normalized in cache:
-            del cache[normalized]
-            _save_provider_models_cache(cache)
+        from hermes_cli.models_cache_lock import write_under_cache_lock
+        path = _provider_models_cache_path()
+
+        # Under the cache lock like every other writer: a locked writer that loaded the cache
+        # before this clear would otherwise save its snapshot after it, bringing the row back.
+        def clear_file() -> None:
+            if provider is None:
+                if path.exists():
+                    path.unlink()
+                return
+            cache = _load_provider_models_cache()
+            normalized = _normalized_cache_slug(provider)
+            if normalized in cache:
+                del cache[normalized]
+                _save_provider_models_cache(cache)
+
+        write_under_cache_lock(path, clear_file)
     except Exception:
         pass
 

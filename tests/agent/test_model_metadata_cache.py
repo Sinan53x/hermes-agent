@@ -49,3 +49,30 @@ def test_concurrent_cache_writers_keep_each_others_entries(monkeypatch, first_wr
 
     assert mm.get_cached_context_length("model-b", "https://b.example/v1") == 64_000
     assert mm.get_cached_context_length("model-a", "https://a.example/v1") == expected_a
+
+
+def test_invalidation_evicts_in_process_probe_caches_when_the_lock_is_unavailable(monkeypatch):
+    """Only the file update needs the cross-process lock: a stale in-process probe result must be
+    dropped even when that lock cannot be taken, or the next resolution reuses it for its TTL."""
+    import contextlib
+
+    import hermes_cli.auth as auth_module
+    from hermes_constants import hermes_home_key
+
+    base_url = "https://a.example/v1"
+    mm._LOCAL_CTX_PROBE_CACHE[("model-a", base_url)] = (200_000, 0.0)
+    mm._LOCAL_CTX_PROBE_CACHE[("ollama_show", "model-a", base_url)] = (200_000, 0.0)
+    mm._BEDROCK_PROBE_FAILURE_CACHE[(hermes_home_key(), base_url, "model-a", "us-east-1")] = 0.0
+
+    @contextlib.contextmanager
+    def wedged_lock(*_args, **_kwargs):
+        raise TimeoutError("Timed out waiting for the context length cache lock")
+        yield
+
+    monkeypatch.setattr(auth_module, "_file_lock", wedged_lock)
+
+    mm._invalidate_cached_context_length("model-a", base_url)
+
+    assert ("model-a", base_url) not in mm._LOCAL_CTX_PROBE_CACHE
+    assert ("ollama_show", "model-a", base_url) not in mm._LOCAL_CTX_PROBE_CACHE
+    assert not [k for k in mm._BEDROCK_PROBE_FAILURE_CACHE if k[1:3] == (base_url, "model-a")]
